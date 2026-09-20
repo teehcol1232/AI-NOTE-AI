@@ -27,15 +27,26 @@ jobs:
           echo "-----"
           find . -maxdepth 2 -type f | sort
 
+          - name: Create debug keystore
+        run: |
+          mkdir -p ~/.android
+          keytool -genkeypair \
+            -v \
+            -keystore ~/.android/debug.keystore \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+          cp ~/.android/debug.keystore ./debug.keystore
+
       - name: Build APK
         run: |
-          if [ -f "./gradlew" ]; then
-            chmod +x ./gradlew
-            ./gradlew assembleDebug
-          else
-            echo "ERROR: gradlew was not found in the repository root."
-            exit 1
-          fi
+          chmod +x ./gradlew
+          ./gradlew assembleDebug
 
       - name: Find APK
         run: |

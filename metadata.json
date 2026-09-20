@@ -1,0 +1,6 @@
+{
+  "name": "AI Study Notes",
+  "description": "Transform handwritten notes, images, PDFs, and text into summaries, flashcards, quizzes, formulas, and interactive study tools.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

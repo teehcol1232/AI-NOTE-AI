@@ -81,6 +81,7 @@ fun ExtractReviewScreen(
                             viewModel.setExtractedNotesText(textContent)
                             onContinue()
                         },
+                        enabled = textContent.isNotBlank(),
                         modifier = Modifier
                             .weight(1.4f)
                             .height(52.dp),
@@ -105,53 +106,100 @@ fun ExtractReviewScreen(
                 .verticalScroll(rememberScrollState())
                 .padding(20.dp)
         ) {
-            // Quality / Confidence Banner
+            // Quality / Confidence / Legibility Banner
+            val isLegible = extracted?.isLegible ?: true
+            val rejectionReason = extracted?.rejectionReason
             val confidence = extracted?.confidencePercent ?: 90
-            Card(
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = if (confidence >= 85) Color(0xFFECFDF5) else Color(0xFFFFFBEB)
-                ),
-                border = CardDefaults.outlinedCardBorder()
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(40.dp)
-                            .clip(CircleShape)
-                            .background(if (confidence >= 85) Color(0xFF10B981) else Color(0xFFF59E0B)),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(
-                            imageVector = if (confidence >= 85) Icons.Default.CheckCircle else Icons.Default.Warning,
-                            contentDescription = null,
-                            tint = Color.White,
-                            modifier = Modifier.size(24.dp)
-                        )
-                    }
 
-                    Spacer(modifier = Modifier.width(14.dp))
-                    Column {
-                        Text(
-                            text = if (confidence >= 85) "High OCR Confidence ($confidence%)" else "Review Recommended ($confidence%)",
-                            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
-                            color = if (confidence >= 85) Color(0xFF065F46) else Color(0xFF92400E)
-                        )
-                        Text(
-                            text = if (confidence >= 85) "Text, structure, and formulas extracted cleanly." else "Some handwriting may need quick manual correction.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = if (confidence >= 85) Color(0xFF047857) else Color(0xFFB45309)
-                        )
+            if (!isLegible || rejectionReason != null) {
+                Card(
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFFFEF2F2)),
+                    border = CardDefaults.outlinedCardBorder()
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(40.dp)
+                                .clip(CircleShape)
+                                .background(Color(0xFFEF4444)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Warning,
+                                contentDescription = null,
+                                tint = Color.White,
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.width(14.dp))
+                        Column {
+                            Text(
+                                text = "Image Legibility Warning",
+                                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                                color = Color(0xFF991B1B)
+                            )
+                            Text(
+                                text = rejectionReason ?: "The image was difficult to read or did not contain clear study notes. Please type or paste your notes below.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color(0xFFB91C1C)
+                            )
+                        }
                     }
                 }
-            }
+                Spacer(modifier = Modifier.height(16.dp))
+            } else {
+                Card(
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (confidence >= 85) Color(0xFFECFDF5) else Color(0xFFFFFBEB)
+                    ),
+                    border = CardDefaults.outlinedCardBorder()
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(40.dp)
+                                .clip(CircleShape)
+                                .background(if (confidence >= 85) Color(0xFF10B981) else Color(0xFFF59E0B)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = if (confidence >= 85) Icons.Default.CheckCircle else Icons.Default.Warning,
+                                contentDescription = null,
+                                tint = Color.White,
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
 
-            Spacer(modifier = Modifier.height(16.dp))
+                        Spacer(modifier = Modifier.width(14.dp))
+                        Column {
+                            Text(
+                                text = if (confidence >= 85) "High OCR Confidence ($confidence%)" else "Review Recommended ($confidence%)",
+                                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                                color = if (confidence >= 85) Color(0xFF065F46) else Color(0xFF92400E)
+                            )
+                            Text(
+                                text = if (confidence >= 85) "Text, structure, and formulas extracted cleanly." else "Some handwriting may need quick manual correction.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (confidence >= 85) Color(0xFF047857) else Color(0xFFB45309)
+                            )
+                        }
+                    }
+                }
+                Spacer(modifier = Modifier.height(16.dp))
+            }
 
             // Extraction Insights
             Row(

@@ -1,0 +1,13 @@
+{
+  "name": "ai-study-notes-backend",
+  "version": "1.0.0",
+  "description": "AI Study Notes backend service for multimodal extraction and grounded study pack generation",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node -e 'console.log(\"OK\")'"
+  },
+  "keywords": ["ai", "study", "notes", "quiz"],
+  "author": "AI Study Notes",
+  "license": "UNLICENSED"
+}

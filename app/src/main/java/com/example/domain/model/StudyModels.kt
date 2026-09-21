@@ -57,7 +57,10 @@ data class ExtractedNoteData(
     val detectedFormulas: List<String> = emptyList(),
     val confidencePercent: Int = 92,
     val isHandwritten: Boolean = true,
-    val pageCount: Int = 1
+    val pageCount: Int = 1,
+    val isLegible: Boolean = true,
+    val rejectionReason: String? = null,
+    val qualityWarning: String? = null
 )
 
 data class EvaluationResult(

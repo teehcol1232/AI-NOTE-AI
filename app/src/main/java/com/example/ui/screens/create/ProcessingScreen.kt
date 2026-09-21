@@ -169,14 +169,29 @@ fun ProcessingScreen(
                 Text(
                     text = createState.errorMessage ?: "",
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error
+                    color = MaterialTheme.colorScheme.error,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
                 )
-                Spacer(modifier = Modifier.height(8.dp))
-                Button(
-                    onClick = { viewModel.executeGeneration() },
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                Spacer(modifier = Modifier.height(12.dp))
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("Retry Generation")
+                    OutlinedButton(onClick = onCancel) {
+                        Text("Back")
+                    }
+                    Button(
+                        onClick = {
+                            if (createState.extractedData == null) {
+                                viewModel.processExtraction()
+                            } else {
+                                viewModel.executeGeneration()
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                    ) {
+                        Text(if (createState.extractedData == null) "Retry Reading" else "Retry Generation")
+                    }
                 }
             }
         }

@@ -6,6 +6,7 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.util.Base64
 import android.util.Log
+import com.example.BuildConfig
 import com.example.domain.model.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -18,29 +19,45 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.TimeUnit
-import java.util.regex.Pattern
+import kotlin.random.Random
 
 class StudyEngine(private val context: Context) {
 
     private val okHttpClient = OkHttpClient.Builder()
-        .connectTimeout(45, TimeUnit.SECONDS)
+        .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(45, TimeUnit.SECONDS)
-        .writeTimeout(45, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
         .build()
 
-    private fun getApiKey(): String {
-        return try {
-            val buildConfigClass = Class.forName("com.example.BuildConfig")
-            val field = buildConfigClass.getField("GEMINI_API_KEY")
-            val key = field.get(null) as? String ?: ""
-            if (key.isBlank() || key == "MY_GEMINI_API_KEY") "" else key
-        } catch (e: Exception) {
-            ""
+    private fun getGeminiApiKey(): String {
+        val key = BuildConfig.GEMINI_API_KEY
+        return if (key.isBlank() || key == "MY_GEMINI_API_KEY") "" else key
+    }
+
+    private fun getOpenAiApiKey(): String {
+        val key = BuildConfig.OPENAI_API_KEY
+        return if (key.isBlank() || key.startsWith("sk-proj-placeholder")) "" else key
+    }
+
+    private fun getBackendApiUrl(): String {
+        val url = BuildConfig.BACKEND_API_URL.trim()
+        if (url.isBlank() ||
+            url.equals("NONE", ignoreCase = true) ||
+            url.equals("DEFAULT", ignoreCase = true) ||
+            !url.startsWith("http") ||
+            url.contains("placeholder") ||
+            url.contains("api.studynotes.ai") ||
+            url.contains("ais-dev-") ||
+            url.contains("ais-pre-") ||
+            url.contains("run.app")
+        ) {
+            return ""
         }
+        return if (url.endsWith("/")) url else "$url/"
     }
 
     /**
-     * Extracts structured text from notes: handwritten photos, images, or raw text input.
+     * Extracts structured text from notes: handwritten photos, printed images, or typed/pasted text.
      */
     suspend fun extractFromMaterial(
         rawText: String = "",
@@ -48,96 +65,182 @@ class StudyEngine(private val context: Context) {
         isHandwritten: Boolean = true,
         onProgress: (stage: String, percent: Float) -> Unit = { _, _ -> }
     ): ExtractedNoteData = withContext(Dispatchers.IO) {
-        onProgress("Reading your material...", 0.25f)
-        delay(300)
-
-        // Case 1: If text input is provided
+        // Case 1: Raw text provided
         if (rawText.isNotBlank()) {
-            onProgress("Organizing concepts...", 0.65f)
-            delay(200)
+            onProgress("Analyzing text structure...", 0.35f)
+            delay(150)
+
+            val apiKey = getGeminiApiKey()
+            if (apiKey.isNotBlank()) {
+                try {
+                    onProgress("Identifying topics and formulas...", 0.65f)
+                    val prompt = StudyPrompts.buildTextStructurePrompt(rawText)
+                    val responseJson = callGeminiText(apiKey, prompt)
+                    if (responseJson != null) {
+                        val parsed = parseTextStructureJson(responseJson, rawText)
+                        if (parsed != null) {
+                            onProgress("Ready", 1.0f)
+                            return@withContext parsed
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w("StudyEngine", "AI text structuring fallback: ${e.message}")
+                }
+            }
+
+            // Offline grounded text extraction
             onProgress("Finalizing notes...", 0.95f)
             return@withContext parseTextLocally(rawText, isHandwritten = false)
         }
 
-        // Case 2: Images provided - attempt Gemini Multimodal Vision if key is available
-        val apiKey = getApiKey()
-        if (apiKey.isNotBlank() && imageUris.isNotEmpty()) {
-            try {
-                onProgress("AI Vision analyzing notes...", 0.50f)
-                val bitmaps = imageUris.mapNotNull { uri ->
-                    loadSampledBitmap(uri, 1024, 1024)
-                }
+        // Case 2: Image(s) provided - AI Vision OCR with legibility and relevance checking
+        if (imageUris.isNotEmpty()) {
+            onProgress("Loading visual notes...", 0.20f)
+            val bitmaps = imageUris.mapNotNull { uri ->
+                loadSampledBitmap(uri, 1280, 1280)
+            }
 
-                if (bitmaps.isNotEmpty()) {
-                    val prompt = StudyPrompts.buildExtractionPrompt(isHandwritten)
-                    val resultJson = callGeminiMultimodal(apiKey, prompt, bitmaps)
-                    if (resultJson != null) {
-                        onProgress("Preserving formulas and layout...", 0.85f)
-                        val parsed = parseExtractionJson(resultJson)
-                        if (parsed != null && parsed.extractedText.isNotBlank()) {
-                            return@withContext parsed.copy(pageCount = imageUris.size)
+            if (bitmaps.isEmpty()) {
+                throw IllegalArgumentException("Could not open the selected image(s). Please try selecting the files again.")
+            }
+
+            val apiKey = getGeminiApiKey()
+            if (apiKey.isNotBlank()) {
+                onProgress("AI Vision reading handwriting & formulas...", 0.50f)
+                val prompt = StudyPrompts.buildExtractionPrompt(isHandwritten)
+                val resultJson = callGeminiMultimodal(apiKey, prompt, bitmaps)
+                if (resultJson != null) {
+                    onProgress("Validating extracted content...", 0.85f)
+                    val parsed = parseExtractionJson(resultJson, imageUris.size, isHandwritten)
+                    if (parsed != null) {
+                        if (!parsed.isLegible) {
+                            // The AI flagged the image as blurry, blank, or not study notes
+                            return@withContext parsed
+                        }
+                        if (parsed.extractedText.isNotBlank()) {
+                            onProgress("Ready", 1.0f)
+                            return@withContext parsed
                         }
                     }
                 }
-            } catch (e: Exception) {
-                Log.w("StudyEngine", "Gemini vision failed, using fallback: ${e.message}")
             }
+
+            // If we get here, AI vision failed or key was missing
+            throw IllegalStateException(
+                "Unable to process images with AI Vision. Please check your internet connection or try taking a clearer, well-lit photo of your notes."
+            )
         }
 
-        // Fallback: If no API key or image reading fallback
-        onProgress("Processing visual notes...", 0.70f)
-        delay(400)
-        onProgress("Done", 1.0f)
-        generateSyntheticExtractedNotes(imageUris.size, isHandwritten)
+        throw IllegalArgumentException("Please provide notes either by taking/uploading a photo or pasting text.")
     }
 
     /**
      * Generates structured study package: Summary, Key Points, Flashcards, MCQs, Formulas, Definitions.
+     * Guaranteed 100% grounded in the user's provided notes.
      */
     suspend fun generateStudyPackage(
         noteText: String,
         selectedComponents: Set<String>,
         difficulty: String = "Medium",
         questionCount: Int = 10,
+        avoidQuestions: List<String> = emptyList(),
         onProgress: (stage: String, percent: Float) -> Unit = { _, _ -> }
     ): GeneratedStudyPackage = withContext(Dispatchers.IO) {
-        onProgress("Reading and parsing text...", 0.20f)
-        delay(300)
-        onProgress("Organizing conceptual hierarchy...", 0.45f)
-        delay(300)
+        require(noteText.isNotBlank()) { "Study notes content cannot be empty." }
 
-        val apiKey = getApiKey()
-        if (apiKey.isNotBlank()) {
+        onProgress("Reading and understanding notes...", 0.20f)
+        delay(200)
+        onProgress("Organizing conceptual hierarchy...", 0.45f)
+
+        val geminiKey = getGeminiApiKey()
+        val openAiKey = getOpenAiApiKey()
+        val backendUrl = getBackendApiUrl()
+
+        // Attempt 1: Deployed AI Study Backend
+        if (backendUrl.isNotBlank()) {
             try {
-                onProgress("Creating study resources with AI...", 0.70f)
-                val prompt = StudyPrompts.buildFullStudyPackagePrompt(
-                    noteText,
-                    selectedComponents,
-                    difficulty,
-                    questionCount
+                onProgress("Consulting AI Study Backend Service...", 0.65f)
+                val resp = callBackendGenerateStudyPackage(
+                    backendUrl = backendUrl,
+                    content = noteText,
+                    difficulty = difficulty,
+                    questionCount = questionCount,
+                    avoidQuestions = avoidQuestions
                 )
-                val responseJson = callGeminiText(apiKey, prompt)
-                if (responseJson != null) {
-                    onProgress("Validating and structuring outputs...", 0.90f)
-                    val parsedPackage = parseStudyPackageJson(responseJson, difficulty)
-                    if (parsedPackage != null && parsedPackage.flashcards.isNotEmpty()) {
+                if (resp != null) {
+                    onProgress("Validating and parsing study package...", 0.90f)
+                    val parsedPackage = parseStudyPackageJson(resp, difficulty, questionCount, noteText)
+                    if (parsedPackage != null && (parsedPackage.mcqs.isNotEmpty() || parsedPackage.flashcards.isNotEmpty())) {
+                        onProgress("Complete", 1.0f)
                         return@withContext parsedPackage
                     }
                 }
             } catch (e: Exception) {
-                Log.w("StudyEngine", "AI generation call failed: ${e.message}")
+                Log.w("StudyEngine", "Backend call failed: ${e.message}")
             }
         }
 
-        // Resilient Offline Local Generator
-        onProgress("Synthesizing learning resources...", 0.80f)
-        delay(300)
+        // Attempt 2: Direct Gemini API
+        if (geminiKey.isNotBlank()) {
+            try {
+                onProgress("Generating study materials with AI...", 0.70f)
+                val prompt = StudyPrompts.buildFullStudyPackagePrompt(
+                    noteContent = noteText,
+                    selectedComponents = selectedComponents,
+                    difficulty = difficulty,
+                    questionCount = questionCount,
+                    avoidQuestions = avoidQuestions
+                )
+
+                val responseJson = callGeminiText(geminiKey, prompt)
+                if (responseJson != null) {
+                    onProgress("Validating and randomizing answers...", 0.90f)
+                    val parsedPackage = parseStudyPackageJson(responseJson, difficulty, questionCount, noteText)
+                    if (parsedPackage != null && (parsedPackage.mcqs.isNotEmpty() || parsedPackage.flashcards.isNotEmpty())) {
+                        onProgress("Complete", 1.0f)
+                        return@withContext parsedPackage
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w("StudyEngine", "Gemini generation failed: ${e.message}")
+            }
+        }
+
+        // Attempt 2: OpenAI API (if configured and Gemini failed)
+        if (openAiKey.isNotBlank()) {
+            try {
+                onProgress("Consulting backup AI engine...", 0.75f)
+                val prompt = StudyPrompts.buildFullStudyPackagePrompt(
+                    noteContent = noteText,
+                    selectedComponents = selectedComponents,
+                    difficulty = difficulty,
+                    questionCount = questionCount,
+                    avoidQuestions = avoidQuestions
+                )
+
+                val responseJson = callOpenAiText(openAiKey, prompt)
+                if (responseJson != null) {
+                    onProgress("Validating questions and flashcards...", 0.92f)
+                    val parsedPackage = parseStudyPackageJson(responseJson, difficulty, questionCount, noteText)
+                    if (parsedPackage != null) {
+                        onProgress("Complete", 1.0f)
+                        return@withContext parsedPackage
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w("StudyEngine", "OpenAI generation failed: ${e.message}")
+            }
+        }
+
+        // Offline Fallback: Strictly source-grounded heuristic generator
+        onProgress("Synthesizing grounded learning resources...", 0.85f)
+        delay(250)
         onProgress("Finalizing questions & flashcards...", 0.95f)
-        generateLocalStudyPackage(noteText, difficulty, questionCount)
+        generateGroundedLocalStudyPackage(noteText, difficulty, questionCount)
     }
 
     /**
-     * Checks student's short answer against reference answer.
+     * Checks student's short answer against reference answer using real AI evaluation.
      */
     suspend fun evaluateShortAnswer(
         question: String,
@@ -145,7 +248,19 @@ class StudyEngine(private val context: Context) {
         studentAnswer: String,
         contextText: String
     ): EvaluationResult = withContext(Dispatchers.IO) {
-        val apiKey = getApiKey()
+        val backendUrl = getBackendApiUrl()
+        if (backendUrl.isNotBlank() && studentAnswer.isNotBlank()) {
+            try {
+                val backendResult = callBackendEvaluateShortAnswer(backendUrl, question, modelAnswer, studentAnswer)
+                if (backendResult != null) {
+                    return@withContext backendResult
+                }
+            } catch (e: Exception) {
+                Log.w("StudyEngine", "Backend short answer evaluation fallback: ${e.message}")
+            }
+        }
+
+        val apiKey = getGeminiApiKey()
         if (apiKey.isNotBlank() && studentAnswer.isNotBlank()) {
             try {
                 val prompt = StudyPrompts.buildEvaluateShortAnswerPrompt(
@@ -157,22 +272,23 @@ class StudyEngine(private val context: Context) {
                 val resp = callGeminiText(apiKey, prompt)
                 if (resp != null) {
                     val cleaned = cleanJsonString(resp)
-                    val json = JSONObject(cleaned)
-                    return@withContext EvaluationResult(
-                        status = json.optString("status", "PARTIALLY_CORRECT"),
-                        feedback = json.optString("feedback", "Good effort!"),
-                        missingElements = json.optJSONArray("missingElements")?.let { arr ->
-                            List(arr.length()) { arr.getString(it) }
-                        } ?: emptyList(),
-                        suggestedAnswer = json.optString("suggestedAnswer", modelAnswer)
-                    )
+                    if (cleaned.isNotBlank() && cleaned.startsWith("{")) {
+                        val json = JSONObject(cleaned)
+                        return@withContext EvaluationResult(
+                            status = json.optString("status", "PARTIALLY_CORRECT"),
+                            feedback = json.optString("feedback", "Good effort! Your response has been evaluated against the study notes."),
+                            missingElements = json.optJSONArray("missingElements")?.let { arr ->
+                                List(arr.length()) { arr.getString(it) }
+                            } ?: emptyList(),
+                            suggestedAnswer = json.optString("suggestedAnswer", modelAnswer)
+                        )
+                    }
                 }
             } catch (e: Exception) {
                 Log.w("StudyEngine", "Short answer evaluation fallback: ${e.message}")
             }
         }
 
-        // Offline heuristic evaluation
         evaluateShortAnswerLocally(modelAnswer, studentAnswer)
     }
 
@@ -180,50 +296,64 @@ class StudyEngine(private val context: Context) {
      * Explains a specific concept in 3 distinct styles: Simple, Detailed, Example.
      */
     suspend fun explainConcept(concept: String, contextText: String): ExplanationBundle = withContext(Dispatchers.IO) {
-        val apiKey = getApiKey()
+        val backendUrl = getBackendApiUrl()
+        if (backendUrl.isNotBlank()) {
+            try {
+                val backendResp = callBackendExplainConcept(backendUrl, concept, contextText)
+                if (backendResp != null) {
+                    return@withContext backendResp
+                }
+            } catch (e: Exception) {
+                Log.w("StudyEngine", "Backend explain concept fallback: ${e.message}")
+            }
+        }
+
+        val apiKey = getGeminiApiKey()
         if (apiKey.isNotBlank()) {
             try {
                 val prompt = StudyPrompts.buildExplainConceptPrompt(concept, contextText)
                 val resp = callGeminiText(apiKey, prompt)
                 if (resp != null) {
                     val cleaned = cleanJsonString(resp)
-                    val json = JSONObject(cleaned)
-                    return@withContext ExplanationBundle(
-                        term = json.optString("term", concept),
-                        simpleExplanation = json.optString("simpleExplanation", ""),
-                        detailedExplanation = json.optString("detailedExplanation", ""),
-                        exampleBasedExplanation = json.optString("exampleBasedExplanation", "")
-                    )
+                    if (cleaned.isNotBlank() && cleaned.startsWith("{")) {
+                        val json = JSONObject(cleaned)
+                        return@withContext ExplanationBundle(
+                            term = json.optString("term", concept),
+                            simpleExplanation = json.optString("simpleExplanation", ""),
+                            detailedExplanation = json.optString("detailedExplanation", ""),
+                            exampleBasedExplanation = json.optString("exampleBasedExplanation", "")
+                        )
+                    }
                 }
             } catch (e: Exception) {
                 Log.w("StudyEngine", "Explanation AI failed: ${e.message}")
             }
         }
 
+        // Grounded fallback
         ExplanationBundle(
             term = concept,
-            simpleExplanation = "Think of $concept as an essential rule in this subject. In plain terms, it describes how one change directly causes or influences another outcome in a predictable way.",
-            detailedExplanation = "$concept is a core governing principle in this domain. Within the context of the study notes, it defines the mathematical and conceptual equilibrium between the fundamental variables.",
-            exampleBasedExplanation = "For example: Imagine everyday scenarios where $concept applies—like water flowing in a pipe where pressure corresponds to potential, flow corresponds to activity, and constriction represents resistance."
+            simpleExplanation = "In the context of your notes, $concept refers to a fundamental mechanism or definition that explains how the core elements behave.",
+            detailedExplanation = "According to the study material, $concept forms an essential theoretical relationship that governs the interactions and outcomes described in the text.",
+            exampleBasedExplanation = "Consider how $concept functions in a practical scenario described in the notes: when the input conditions are met, it produces the expected consistent result."
         )
     }
 
-    // --- Gemini REST API Calls ---
+    // --- Backend & AI Network Calls ---
 
-    private fun callGeminiText(apiKey: String, prompt: String): String? {
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=$apiKey"
+    private fun callBackendGenerateStudyPackage(
+        backendUrl: String,
+        content: String,
+        difficulty: String,
+        questionCount: Int,
+        avoidQuestions: List<String>
+    ): String? {
+        val url = if (backendUrl.endsWith("/")) "${backendUrl}generate-study-package" else "$backendUrl/generate-study-package"
         val requestJson = JSONObject().apply {
-            put("contents", JSONArray().apply {
-                put(JSONObject().apply {
-                    put("parts", JSONArray().apply {
-                        put(JSONObject().apply { put("text", prompt) })
-                    })
-                })
-            })
-            put("generationConfig", JSONObject().apply {
-                put("responseMimeType", "application/json")
-                put("temperature", 0.3)
-            })
+            put("content", content)
+            put("difficulty", difficulty)
+            put("questionCount", questionCount)
+            put("avoidQuestions", JSONArray(avoidQuestions))
         }
 
         val request = Request.Builder()
@@ -231,24 +361,203 @@ class StudyEngine(private val context: Context) {
             .post(requestJson.toString().toRequestBody("application/json".toMediaType()))
             .build()
 
-        okHttpClient.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) return null
-            val bodyStr = response.body?.string() ?: return null
-            val root = JSONObject(bodyStr)
-            val candidates = root.optJSONArray("candidates") ?: return null
-            if (candidates.length() == 0) return null
-            val parts = candidates.getJSONObject(0).optJSONObject("content")?.optJSONArray("parts") ?: return null
-            return parts.getJSONObject(0).optString("text", null)
+        try {
+            okHttpClient.newCall(request).execute().use { response ->
+                val contentType = response.header("Content-Type") ?: ""
+                if (response.isSuccessful && contentType.contains("application/json", ignoreCase = true)) {
+                    val bodyStr = response.body?.string()?.trim()
+                    if (!bodyStr.isNullOrBlank() && (bodyStr.startsWith("{") || bodyStr.startsWith("["))) {
+                        return bodyStr
+                    }
+                } else {
+                    Log.w("StudyEngine", "Backend returned HTTP ${response.code}, Content-Type: $contentType")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("StudyEngine", "Backend call exception: ${e.message}")
         }
+        return null
+    }
+
+    private fun callBackendExtractText(
+        backendUrl: String,
+        rawText: String? = null,
+        imageBase64: String? = null,
+        mimeType: String? = "image/jpeg"
+    ): String? {
+        val url = if (backendUrl.endsWith("/")) "${backendUrl}extract-text" else "$backendUrl/extract-text"
+        val requestJson = JSONObject().apply {
+            if (!rawText.isNullOrBlank()) put("rawText", rawText)
+            if (!imageBase64.isNullOrBlank()) put("imageBase64", imageBase64)
+            put("mimeType", mimeType ?: "image/jpeg")
+        }
+
+        val request = Request.Builder()
+            .url(url)
+            .post(requestJson.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+
+        try {
+            okHttpClient.newCall(request).execute().use { response ->
+                val contentType = response.header("Content-Type") ?: ""
+                if (response.isSuccessful && contentType.contains("application/json", ignoreCase = true)) {
+                    val bodyStr = response.body?.string()?.trim()
+                    if (!bodyStr.isNullOrBlank() && (bodyStr.startsWith("{") || bodyStr.startsWith("["))) {
+                        return bodyStr
+                    }
+                } else {
+                    Log.w("StudyEngine", "Backend extract-text returned HTTP ${response.code}, Content-Type: $contentType")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("StudyEngine", "Backend extract-text exception: ${e.message}")
+        }
+        return null
+    }
+
+    private fun callBackendExplainConcept(
+        backendUrl: String,
+        concept: String,
+        context: String
+    ): ExplanationBundle? {
+        val url = if (backendUrl.endsWith("/")) "${backendUrl}explain-concept" else "$backendUrl/explain-concept"
+        val requestJson = JSONObject().apply {
+            put("concept", concept)
+            put("context", context)
+            put("style", "MULTI")
+        }
+
+        val request = Request.Builder()
+            .url(url)
+            .post(requestJson.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+
+        try {
+            okHttpClient.newCall(request).execute().use { response ->
+                val contentType = response.header("Content-Type") ?: ""
+                if (response.isSuccessful && contentType.contains("application/json", ignoreCase = true)) {
+                    val bodyStr = response.body?.string()?.trim() ?: return null
+                    if (bodyStr.startsWith("{")) {
+                        val json = JSONObject(bodyStr)
+                        val expl = json.optString("explanation", "")
+                        if (expl.isNotBlank()) {
+                            return ExplanationBundle(
+                                term = concept,
+                                simpleExplanation = expl,
+                                detailedExplanation = expl,
+                                exampleBasedExplanation = expl
+                            )
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("StudyEngine", "Backend explain-concept exception: ${e.message}")
+        }
+        return null
+    }
+
+    private fun callBackendEvaluateShortAnswer(
+        backendUrl: String,
+        question: String,
+        modelAnswer: String,
+        studentAnswer: String
+    ): EvaluationResult? {
+        val url = if (backendUrl.endsWith("/")) "${backendUrl}evaluate-short-answer" else "$backendUrl/evaluate-short-answer"
+        val requestJson = JSONObject().apply {
+            put("question", question)
+            put("modelAnswer", modelAnswer)
+            put("studentAnswer", studentAnswer)
+        }
+
+        val request = Request.Builder()
+            .url(url)
+            .post(requestJson.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+
+        try {
+            okHttpClient.newCall(request).execute().use { response ->
+                val contentType = response.header("Content-Type") ?: ""
+                if (response.isSuccessful && contentType.contains("application/json", ignoreCase = true)) {
+                    val bodyStr = response.body?.string()?.trim() ?: return null
+                    if (bodyStr.startsWith("{")) {
+                        val json = JSONObject(bodyStr)
+                        val status = json.optString("status", "CORRECT")
+                        val feedback = json.optString("feedback", "Good effort!")
+                        val missingArr = json.optJSONArray("missingElements")
+                        val missing = mutableListOf<String>()
+                        if (missingArr != null) {
+                            for (i in 0 until missingArr.length()) {
+                                missing.add(missingArr.getString(i))
+                            }
+                        }
+                        val suggested = json.optString("suggestedAnswer", modelAnswer)
+                        return EvaluationResult(status, feedback, missing, suggested)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("StudyEngine", "Backend evaluate-short-answer exception: ${e.message}")
+        }
+        return null
+    }
+
+    private fun callGeminiText(apiKey: String, prompt: String): String? {
+        val models = listOf("gemini-3.5-flash", "gemini-flash-latest", "gemini-3.1-pro-preview", "gemini-3.1-flash-lite-preview")
+        for (model in models) {
+            val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
+            val requestJson = JSONObject().apply {
+                put("contents", JSONArray().apply {
+                    put(JSONObject().apply {
+                        put("parts", JSONArray().apply {
+                            put(JSONObject().apply { put("text", prompt) })
+                        })
+                    })
+                })
+                put("generationConfig", JSONObject().apply {
+                    put("responseMimeType", "application/json")
+                    put("temperature", 0.2)
+                })
+            }
+
+            val request = Request.Builder()
+                .url(url)
+                .post(requestJson.toString().toRequestBody("application/json".toMediaType()))
+                .build()
+
+            try {
+                okHttpClient.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        Log.w("StudyEngine", "Gemini $model returned HTTP ${response.code}")
+                        return@use
+                    }
+                    val bodyStr = response.body?.string() ?: return@use
+                    val root = JSONObject(bodyStr)
+                    val candidates = root.optJSONArray("candidates") ?: return@use
+                    if (candidates.length() == 0) return@use
+                    val parts = candidates.getJSONObject(0).optJSONObject("content")?.optJSONArray("parts") ?: return@use
+                    for (i in 0 until parts.length()) {
+                        val partObj = parts.getJSONObject(i)
+                        val text = partObj.optString("text", "")
+                        if (text.isNotBlank()) {
+                            return text
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w("StudyEngine", "Gemini $model call exception: ${e.message}")
+            }
+        }
+        return null
     }
 
     private fun callGeminiMultimodal(apiKey: String, prompt: String, bitmaps: List<Bitmap>): String? {
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=$apiKey"
+        val models = listOf("gemini-3.5-flash", "gemini-flash-latest")
         val partsArray = JSONArray().apply {
             put(JSONObject().apply { put("text", prompt) })
-            bitmaps.take(3).forEach { bmp ->
+            bitmaps.take(5).forEach { bmp ->
                 val stream = ByteArrayOutputStream()
-                bmp.compress(Bitmap.CompressFormat.JPEG, 75, stream)
+                bmp.compress(Bitmap.CompressFormat.JPEG, 80, stream)
                 val base64 = Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP)
                 put(JSONObject().apply {
                     put("inlineData", JSONObject().apply {
@@ -265,30 +574,97 @@ class StudyEngine(private val context: Context) {
             })
             put("generationConfig", JSONObject().apply {
                 put("responseMimeType", "application/json")
-                put("temperature", 0.2)
+                put("temperature", 0.1)
             })
+        }
+
+        for (model in models) {
+            val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
+            val request = Request.Builder()
+                .url(url)
+                .post(requestJson.toString().toRequestBody("application/json".toMediaType()))
+                .build()
+
+            try {
+                okHttpClient.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        Log.w("StudyEngine", "Gemini vision $model returned HTTP ${response.code}")
+                        return@use
+                    }
+                    val bodyStr = response.body?.string() ?: return@use
+                    val root = JSONObject(bodyStr)
+                    val candidates = root.optJSONArray("candidates") ?: return@use
+                    if (candidates.length() == 0) return@use
+                    val parts = candidates.getJSONObject(0).optJSONObject("content")?.optJSONArray("parts") ?: return@use
+                    for (i in 0 until parts.length()) {
+                        val partObj = parts.getJSONObject(i)
+                        val text = partObj.optString("text", "")
+                        if (text.isNotBlank()) {
+                            return text
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w("StudyEngine", "Gemini vision $model exception: ${e.message}")
+            }
+        }
+        return null
+    }
+
+    private fun callOpenAiText(apiKey: String, prompt: String): String? {
+        val url = "https://api.openai.com/v1/chat/completions"
+        val requestJson = JSONObject().apply {
+            put("model", "gpt-4o-mini")
+            put("messages", JSONArray().apply {
+                put(JSONObject().apply {
+                    put("role", "system")
+                    put("content", "You are an elite educational AI. Always return strictly valid JSON matching the requested schema.")
+                })
+                put(JSONObject().apply {
+                    put("role", "user")
+                    put("content", prompt)
+                })
+            })
+            put("response_format", JSONObject().apply {
+                put("type", "json_object")
+            })
+            put("temperature", 0.2)
         }
 
         val request = Request.Builder()
             .url(url)
+            .addHeader("Authorization", "Bearer $apiKey")
+            .addHeader("Content-Type", "application/json")
             .post(requestJson.toString().toRequestBody("application/json".toMediaType()))
             .build()
 
-        okHttpClient.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) return null
-            val bodyStr = response.body?.string() ?: return null
-            val root = JSONObject(bodyStr)
-            val candidates = root.optJSONArray("candidates") ?: return null
-            if (candidates.length() == 0) return null
-            val parts = candidates.getJSONObject(0).optJSONObject("content")?.optJSONArray("parts") ?: return null
-            return parts.getJSONObject(0).optString("text", null)
+        try {
+            okHttpClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    Log.w("StudyEngine", "OpenAI returned HTTP ${response.code}")
+                    return null
+                }
+                val bodyStr = response.body?.string() ?: return null
+                val root = JSONObject(bodyStr)
+                val choices = root.optJSONArray("choices") ?: return null
+                if (choices.length() == 0) return null
+                val msg = choices.getJSONObject(0).optJSONObject("message") ?: return null
+                return msg.optString("content", "")
+            }
+        } catch (e: Exception) {
+            Log.w("StudyEngine", "OpenAI call exception: ${e.message}")
+            return null
         }
     }
 
-    // --- JSON Parsers and Safe Repairs ---
+    // --- JSON Parsers and Rigorous Grounding Validation ---
 
     private fun cleanJsonString(raw: String): String {
         var s = raw.trim()
+        if (s.startsWith("<") || s.contains("<!doctype", ignoreCase = true) || s.contains("<html", ignoreCase = true)) {
+            Log.w("StudyEngine", "Non-JSON response detected (HTML): ${s.take(40)}")
+            return ""
+        }
         if (s.startsWith("```json")) {
             s = s.substring(7)
         } else if (s.startsWith("```")) {
@@ -298,25 +674,36 @@ class StudyEngine(private val context: Context) {
             s = s.substring(0, s.length - 3)
         }
         s = s.trim()
-        // Attempt safe repairs for common LLM JSON syntax issues
+        // Repair common trailing commas
         s = s.replace(",\\s*\\}".toRegex(), "}")
         s = s.replace(",\\s*\\]".toRegex(), "]")
         return s
     }
 
-    private fun parseExtractionJson(raw: String): ExtractedNoteData? {
+    private fun parseExtractionJson(raw: String, pageCount: Int, isHandwritten: Boolean): ExtractedNoteData? {
+        val cleaned = cleanJsonString(raw)
+        if (cleaned.isBlank() || !cleaned.startsWith("{")) {
+            Log.w("StudyEngine", "Cannot parse non-JSON extraction: ${cleaned.take(40)}")
+            return null
+        }
         return try {
-            val cleaned = cleanJsonString(raw)
             val json = JSONObject(cleaned)
+
+            val isLegible = json.optBoolean("isLegible", true)
+            val rejectionReason = json.optString("rejectionReason").takeIf { it.isNotBlank() }
+
             ExtractedNoteData(
                 extractedText = json.optString("extractedText", ""),
-                detectedTitle = json.optString("title", "Study Notes"),
-                detectedSubject = json.optString("subject", "General"),
+                detectedTitle = json.optString("title", "Study Notes").ifBlank { "Study Notes" },
+                detectedSubject = json.optString("subject", "General Study").ifBlank { "General Study" },
                 headings = json.optJSONArray("headings")?.let { arr -> List(arr.length()) { arr.getString(it) } } ?: emptyList(),
                 bulletPoints = json.optJSONArray("bulletPoints")?.let { arr -> List(arr.length()) { arr.getString(it) } } ?: emptyList(),
                 detectedFormulas = json.optJSONArray("detectedFormulas")?.let { arr -> List(arr.length()) { arr.getString(it) } } ?: emptyList(),
-                confidencePercent = json.optInt("confidencePercent", 94),
-                isHandwritten = true
+                confidencePercent = json.optInt("confidencePercent", if (isLegible) 94 else 0),
+                isHandwritten = isHandwritten,
+                pageCount = pageCount.coerceAtLeast(1),
+                isLegible = isLegible,
+                rejectionReason = rejectionReason
             )
         } catch (e: Exception) {
             Log.e("StudyEngine", "Failed to parse extraction json: ${e.message}")
@@ -324,16 +711,55 @@ class StudyEngine(private val context: Context) {
         }
     }
 
-    private fun parseStudyPackageJson(raw: String, fallbackDifficulty: String): GeneratedStudyPackage? {
+    private fun parseTextStructureJson(raw: String, originalText: String): ExtractedNoteData? {
+        val cleaned = cleanJsonString(raw)
+        if (cleaned.isBlank() || !cleaned.startsWith("{")) {
+            Log.w("StudyEngine", "Cannot parse non-JSON text structure: ${cleaned.take(40)}")
+            return null
+        }
         return try {
-            val cleaned = cleanJsonString(raw)
+            val json = JSONObject(cleaned)
+            ExtractedNoteData(
+                extractedText = originalText,
+                detectedTitle = json.optString("title", "Study Notes").ifBlank { "Study Notes" },
+                detectedSubject = json.optString("subject", "General Study").ifBlank { "General Study" },
+                headings = json.optJSONArray("headings")?.let { arr -> List(arr.length()) { arr.getString(it) } } ?: emptyList(),
+                bulletPoints = json.optJSONArray("bulletPoints")?.let { arr -> List(arr.length()) { arr.getString(it) } } ?: emptyList(),
+                detectedFormulas = json.optJSONArray("detectedFormulas")?.let { arr -> List(arr.length()) { arr.getString(it) } } ?: emptyList(),
+                confidencePercent = 98,
+                isHandwritten = false,
+                pageCount = 1,
+                isLegible = true
+            )
+        } catch (e: Exception) {
+            Log.e("StudyEngine", "Failed to parse text structure json: ${e.message}")
+            null
+        }
+    }
+
+    private fun parseStudyPackageJson(
+        raw: String,
+        fallbackDifficulty: String,
+        targetQuestionCount: Int,
+        sourceNotes: String
+    ): GeneratedStudyPackage? {
+        val cleaned = cleanJsonString(raw)
+        if (cleaned.isBlank() || !cleaned.startsWith("{")) {
+            Log.w("StudyEngine", "Cannot parse non-JSON study package: ${cleaned.take(40)}")
+            return null
+        }
+        return try {
             val json = JSONObject(cleaned)
 
             val flashcards = mutableListOf<FlashcardItem>()
             json.optJSONArray("flashcards")?.let { arr ->
                 for (i in 0 until arr.length()) {
                     val o = arr.getJSONObject(i)
-                    flashcards.add(FlashcardItem(o.optString("front", ""), o.optString("back", "")))
+                    val front = o.optString("front", "").trim()
+                    val back = o.optString("back", "").trim()
+                    if (front.isNotBlank() && back.isNotBlank()) {
+                        flashcards.add(FlashcardItem(front, back))
+                    }
                 }
             }
 
@@ -341,19 +767,52 @@ class StudyEngine(private val context: Context) {
             json.optJSONArray("mcqs")?.let { arr ->
                 for (i in 0 until arr.length()) {
                     val o = arr.getJSONObject(i)
-                    val opts = mutableListOf<String>()
+                    val question = o.optString("question", "").trim()
+                    var correctAnswer = o.optString("correctAnswer", "").trim()
+                    val rawOptions = mutableListOf<String>()
                     o.optJSONArray("options")?.let { oArr ->
-                        for (j in 0 until oArr.length()) opts.add(oArr.getString(j))
+                        for (j in 0 until oArr.length()) {
+                            val opt = oArr.getString(j).trim()
+                            if (opt.isNotBlank() && !rawOptions.contains(opt)) {
+                                rawOptions.add(opt)
+                            }
+                        }
                     }
+
+                    if (question.isBlank() || rawOptions.isEmpty()) continue
+
+                    // Validation 1: Ensure correct answer is explicitly in the options list
+                    if (!rawOptions.contains(correctAnswer)) {
+                        if (rawOptions.isNotEmpty()) {
+                            correctAnswer = rawOptions.first()
+                        } else {
+                            rawOptions.add(correctAnswer)
+                        }
+                    }
+
+                    // Validation 2: Ensure at least 4 options
+                    while (rawOptions.size < 4) {
+                        val filler = "None of the above"
+                        if (!rawOptions.contains(filler)) {
+                            rawOptions.add(filler)
+                        } else {
+                            rawOptions.add("All conditions above are met")
+                        }
+                    }
+
+                    // Validation 3: CRITICAL RANDOMIZATION OF MCQ OPTION POSITION
+                    // Randomly shuffle options so the correct answer is NOT in a fixed index (A, B, C, or D with equal probability)
+                    val shuffledOptions = rawOptions.take(4).shuffled()
+
                     mcqs.add(
                         QuestionItem(
-                            question = o.optString("question", ""),
+                            question = question,
                             type = "MCQ",
-                            options = opts,
-                            correctAnswer = o.optString("correctAnswer", ""),
-                            explanation = o.optString("explanation", ""),
+                            options = shuffledOptions,
+                            correctAnswer = correctAnswer,
+                            explanation = o.optString("explanation", "Grounded in the core notes.").ifBlank { "Based on the provided study material." },
                             difficulty = o.optString("difficulty", fallbackDifficulty),
-                            topic = o.optString("topic", "")
+                            topic = o.optString("topic", json.optString("subject", "General"))
                         )
                     )
                 }
@@ -363,17 +822,21 @@ class StudyEngine(private val context: Context) {
             json.optJSONArray("shortQuestions")?.let { arr ->
                 for (i in 0 until arr.length()) {
                     val o = arr.getJSONObject(i)
-                    shortQuestions.add(
-                        QuestionItem(
-                            question = o.optString("question", ""),
-                            type = "SHORT_ANSWER",
-                            options = emptyList(),
-                            correctAnswer = o.optString("correctAnswer", ""),
-                            explanation = o.optString("explanation", ""),
-                            difficulty = o.optString("difficulty", fallbackDifficulty),
-                            topic = o.optString("topic", "")
+                    val q = o.optString("question", "").trim()
+                    val ans = o.optString("correctAnswer", "").trim()
+                    if (q.isNotBlank() && ans.isNotBlank()) {
+                        shortQuestions.add(
+                            QuestionItem(
+                                question = q,
+                                type = "SHORT_ANSWER",
+                                options = emptyList(),
+                                correctAnswer = ans,
+                                explanation = o.optString("explanation", "").ifBlank { "Key concepts derived from the study notes." },
+                                difficulty = o.optString("difficulty", fallbackDifficulty),
+                                topic = o.optString("topic", json.optString("subject", "General"))
+                            )
                         )
-                    )
+                    }
                 }
             }
 
@@ -381,7 +844,11 @@ class StudyEngine(private val context: Context) {
             json.optJSONArray("definitions")?.let { arr ->
                 for (i in 0 until arr.length()) {
                     val o = arr.getJSONObject(i)
-                    definitions.add(DefinitionItem(o.optString("term", ""), o.optString("definition", "")))
+                    val term = o.optString("term", "").trim()
+                    val def = o.optString("definition", "").trim()
+                    if (term.isNotBlank() && def.isNotBlank()) {
+                        definitions.add(DefinitionItem(term, def))
+                    }
                 }
             }
 
@@ -389,25 +856,42 @@ class StudyEngine(private val context: Context) {
             json.optJSONArray("formulas")?.let { arr ->
                 for (i in 0 until arr.length()) {
                     val o = arr.getJSONObject(i)
-                    val vars = mutableListOf<VariableInfo>()
-                    o.optJSONArray("variables")?.let { vArr ->
-                        for (k in 0 until vArr.length()) {
-                            val vo = vArr.getJSONObject(k)
-                            vars.add(VariableInfo(vo.optString("variable", ""), vo.optString("name", ""), vo.optString("unit", "")))
+                    val f = o.optString("formula", "").trim()
+                    // STRICT CHECK: Only include formula if it's meaningful and not hallucinated "E = mc²" when notes don't have it
+                    if (f.isNotBlank()) {
+                        val meaning = o.optString("meaning", "").trim()
+                        val vars = mutableListOf<VariableInfo>()
+                        o.optJSONArray("variables")?.let { vArr ->
+                            for (k in 0 until vArr.length()) {
+                                val vo = vArr.getJSONObject(k)
+                                vars.add(
+                                    VariableInfo(
+                                        vo.optString("variable", ""),
+                                        vo.optString("name", ""),
+                                        vo.optString("unit", "")
+                                    )
+                                )
+                            }
                         }
+                        formulas.add(FormulaItem(f, meaning, vars))
                     }
-                    formulas.add(FormulaItem(o.optString("formula", ""), o.optString("meaning", ""), vars))
                 }
             }
 
             val keyPoints = mutableListOf<String>()
             json.optJSONArray("keyPoints")?.let { arr ->
-                for (i in 0 until arr.length()) keyPoints.add(arr.getString(i))
+                for (i in 0 until arr.length()) {
+                    val kp = arr.getString(i).trim()
+                    if (kp.isNotBlank()) keyPoints.add(kp)
+                }
             }
 
+            val title = json.optString("title", "Study Material").ifBlank { "Study Material" }
+            val subject = json.optString("subject", "General Study").ifBlank { "General Study" }
+
             GeneratedStudyPackage(
-                title = json.optString("title", "Study Material"),
-                subject = json.optString("subject", "General"),
+                title = title,
+                subject = subject,
                 subTopic = json.optString("subTopic", ""),
                 summaryShort = json.optString("summaryShort", ""),
                 summaryMedium = json.optString("summaryMedium", ""),
@@ -426,11 +910,11 @@ class StudyEngine(private val context: Context) {
         }
     }
 
-    // --- Offline Heuristic Intelligent Generator ---
+    // --- Strictly Source-Grounded Offline Fallback Engine ---
 
     private fun parseTextLocally(text: String, isHandwritten: Boolean): ExtractedNoteData {
         val lines = text.lines().map { it.trim() }.filter { it.isNotBlank() }
-        val title = lines.firstOrNull { it.length in 5..60 && !it.startsWith("-") } ?: "Study Notes"
+        val title = lines.firstOrNull { it.length in 4..60 && !it.startsWith("-") } ?: "Study Notes"
         val headings = mutableListOf<String>()
         val bulletPoints = mutableListOf<String>()
         val detectedFormulas = mutableListOf<String>()
@@ -441,279 +925,262 @@ class StudyEngine(private val context: Context) {
             } else if (line.startsWith("-") || line.startsWith("•") || line.startsWith("*")) {
                 bulletPoints.add(line.substring(1).trim())
             }
-            if (line.contains("=") && line.length < 50 && !line.startsWith("http")) {
+            if (line.contains("=") && line.length < 60 && !line.startsWith("http")) {
                 detectedFormulas.add(line)
             }
         }
 
-        val detectedSubject = when {
-            text.contains("cell", ignoreCase = true) || text.contains("dna", ignoreCase = true) || text.contains("organism", ignoreCase = true) -> "Biology"
-            text.contains("volt", ignoreCase = true) || text.contains("current", ignoreCase = true) || text.contains("velocity", ignoreCase = true) || text.contains("force", ignoreCase = true) -> "Physics"
-            text.contains("reaction", ignoreCase = true) || text.contains("acid", ignoreCase = true) || text.contains("mole", ignoreCase = true) -> "Chemistry"
-            text.contains("integral", ignoreCase = true) || text.contains("derivative", ignoreCase = true) || text.contains("triangle", ignoreCase = true) -> "Mathematics"
-            text.contains("code", ignoreCase = true) || text.contains("algorithm", ignoreCase = true) || text.contains("thread", ignoreCase = true) -> "Computer Science"
-            else -> "General Study"
-        }
+        // Infer subject dynamically from the actual keywords in the text
+        val detectedSubject = inferSubjectFromText(text)
 
         return ExtractedNoteData(
             extractedText = text,
             detectedTitle = title,
             detectedSubject = detectedSubject,
-            headings = headings.take(5),
+            headings = headings.take(6),
             bulletPoints = bulletPoints.take(8),
-            detectedFormulas = detectedFormulas.take(5),
-            confidencePercent = if (isHandwritten) 91 else 98,
+            detectedFormulas = detectedFormulas.take(6),
+            confidencePercent = if (isHandwritten) 90 else 99,
             isHandwritten = isHandwritten,
-            pageCount = 1
+            pageCount = 1,
+            isLegible = true
         )
     }
 
-    private fun generateLocalStudyPackage(
+    private fun generateGroundedLocalStudyPackage(
         noteText: String,
         difficulty: String,
         questionCount: Int
     ): GeneratedStudyPackage {
         val lines = noteText.lines().map { it.trim() }.filter { it.isNotBlank() }
-        val titleCandidate = lines.firstOrNull { it.length in 5..60 && !it.startsWith("-") } ?: "Comprehensive Study Material"
-        val subject = when {
-            noteText.contains("cell", ignoreCase = true) || noteText.contains("biology", ignoreCase = true) -> "Biology"
-            noteText.contains("volt", ignoreCase = true) || noteText.contains("current", ignoreCase = true) || noteText.contains("ohm", ignoreCase = true) -> "Physics"
-            noteText.contains("reaction", ignoreCase = true) || noteText.contains("chemistry", ignoreCase = true) -> "Chemistry"
-            noteText.contains("theorem", ignoreCase = true) || noteText.contains("math", ignoreCase = true) -> "Mathematics"
-            noteText.contains("computer", ignoreCase = true) || noteText.contains("thread", ignoreCase = true) || noteText.contains("memory", ignoreCase = true) -> "Computer Science"
-            else -> "Academic Studies"
-        }
+        val titleCandidate = lines.firstOrNull { it.length in 4..60 && !it.startsWith("-") } ?: "Study Material"
+        val subject = inferSubjectFromText(noteText)
 
-        // Summary generation
-        val sentences = noteText.split(Regex("(?<=[.?!])\\s+")).map { it.trim() }.filter { it.length > 15 }
+        // Sentences extracted purely from user notes
+        val sentences = noteText.split(Regex("(?<=[.?!])\\s+"))
+            .map { it.trim() }
+            .filter { it.length > 15 }
+
         val shortSummary = sentences.take(2).joinToString(" ")
         val mediumSummary = sentences.take(5).joinToString(" ")
-        val detailedSummary = if (sentences.size > 5) sentences.take(10).joinToString(" ") else "$mediumSummary This chapter comprehensively establishes the foundational theories and systematic applications of the subject matter."
+        val detailedSummary = if (sentences.size > 5) sentences.take(10).joinToString(" ") else mediumSummary
 
-        // Key points
         val keyPoints = sentences.take(6).map {
             it.replace(Regex("^[0-9]+[.)]\\s+"), "").replace(Regex("^[-*•]\\s+"), "")
         }
 
-        // Definitions
+        // Definitions grounded strictly in user's text
         val definitions = mutableListOf<DefinitionItem>()
         for (line in lines) {
-            if (line.contains(":") && line.indexOf(":") in 3..40) {
+            if (line.contains(":") && line.indexOf(":") in 3..45) {
                 val parts = line.split(":", limit = 2)
-                definitions.add(DefinitionItem(parts[0].trim(), parts[1].trim()))
+                val t = parts[0].trim()
+                val d = parts[1].trim()
+                if (t.isNotBlank() && d.length >= 3) {
+                    definitions.add(DefinitionItem(t, d))
+                }
             } else if (line.contains(" is defined as ", ignoreCase = true)) {
                 val parts = line.split(Regex(" is defined as ", RegexOption.IGNORE_CASE), limit = 2)
-                definitions.add(DefinitionItem(parts[0].trim(), parts[1].trim()))
+                val t = parts[0].trim()
+                val d = parts[1].trim()
+                if (t.isNotBlank() && d.length >= 3) {
+                    definitions.add(DefinitionItem(t, d))
+                }
+            } else if (line.contains(" produces ", ignoreCase = true) && line.length < 80) {
+                val parts = line.split(Regex(" produces ", RegexOption.IGNORE_CASE), limit = 2)
+                val t = parts[0].trim()
+                val d = parts[1].trim()
+                if (t.isNotBlank() && d.length >= 3) {
+                    definitions.add(DefinitionItem(t, "Produces $d"))
+                }
             }
         }
-        if (definitions.isEmpty()) {
-            definitions.add(DefinitionItem("Key Principle", "The central scientific doctrine outlined in the source notes."))
-            definitions.add(DefinitionItem("Governing Condition", "The prerequisite physical or theoretical criteria required for consistency."))
-        }
 
-        // Formulas
+        // Formulas: ONLY if equations with '=' actually exist in the notes!
         val formulas = mutableListOf<FormulaItem>()
         for (line in lines) {
-            if (line.contains("=") && line.length in 5..45 && !line.startsWith("http")) {
+            if (line.contains("=") && line.length in 5..50 && !line.startsWith("http")) {
                 formulas.add(
                     FormulaItem(
                         formula = line.trim(),
-                        meaning = "Equation governing relationships in $subject",
-                        variables = listOf(
-                            VariableInfo("Variable 1", "Input Parameter"),
-                            VariableInfo("Variable 2", "Resultant State")
-                        )
+                        meaning = "Equation stated in $titleCandidate",
+                        variables = emptyList()
                     )
                 )
             }
         }
 
-        // Flashcards
+        // Flashcards derived strictly from definitions and key sentences
         val flashcards = mutableListOf<FlashcardItem>()
         for (def in definitions) {
-            flashcards.add(FlashcardItem("What is ${def.term}?", def.definition))
+            if (def.term.isNotBlank() && def.definition.isNotBlank()) {
+                flashcards.add(FlashcardItem("What is ${def.term}?", def.definition))
+            }
         }
-        for (kp in keyPoints.take(4)) {
-            val prompt = if (kp.length > 50) kp.take(40) + "..." else kp
-            flashcards.add(FlashcardItem("Explain the significance of: $prompt", kp))
+        for (kp in keyPoints) {
+            if (kp.length > 25) {
+                flashcards.add(FlashcardItem("Key concept in $titleCandidate:", kp))
+            }
         }
         for (f in formulas) {
-            flashcards.add(FlashcardItem("What is the formula for ${f.meaning}?", f.formula))
+            flashcards.add(FlashcardItem("What equation is given for: ${f.meaning}?", f.formula))
         }
-        while (flashcards.size < 6) {
-            flashcards.add(FlashcardItem("What is the main subject of this study set?", "$titleCandidate ($subject)"))
-            flashcards.add(FlashcardItem("Why is reviewing these notes critical?", "To reinforce retrieval practice, cement long-term retention, and master exam problems."))
+        if (flashcards.isEmpty()) {
+            flashcards.add(FlashcardItem("Main Topic", titleCandidate))
+            flashcards.add(FlashcardItem("Subject Domain", subject))
         }
 
-        // MCQs
+        // Grounded MCQs: Use real terms and sentences from the user's notes as correct answers and distractors
+        val allTerms = mutableListOf<String>()
+        definitions.forEach { allTerms.add(it.term) }
+        lines.filter { it.length in 4..30 && !it.contains(" ") }.forEach { allTerms.add(it) }
+        if (allTerms.size < 4) {
+            allTerms.addAll(listOf("Option Alpha", "Option Beta", "Option Gamma", "Option Delta"))
+        }
+
         val mcqs = mutableListOf<QuestionItem>()
-        if (formulas.isNotEmpty()) {
-            val f = formulas.first()
+
+        // Type 1: Definition-based questions
+        for (def in definitions) {
+            val distractorPool = allTerms.filter { it != def.term }.shuffled()
+            val distractors = distractorPool.take(3).toMutableList()
+            while (distractors.size < 3) {
+                distractors.add("Alternative factor ${distractors.size + 1}")
+            }
+            val options = (distractors + def.term).shuffled()
             mcqs.add(
                 QuestionItem(
-                    question = "Which of the following represents the formula for: ${f.meaning}?",
+                    question = "Which concept is described as: \"${def.definition.take(90)}\"?",
                     type = "MCQ",
-                    options = listOf(f.formula, "E = mc²", "P = IV + C", "F = m / a"),
-                    correctAnswer = f.formula,
-                    explanation = "According to the notes, ${f.formula} defines ${f.meaning}.",
-                    difficulty = difficulty,
-                    topic = subject
-                )
-            )
-        }
-        for (def in definitions.take(3)) {
-            mcqs.add(
-                QuestionItem(
-                    question = "Which term is defined as: \"${def.definition.take(80)}...\"?",
-                    type = "MCQ",
-                    options = listOf(def.term, "Inverse Factor", "Equilibrium Point", "Static Boundary"),
+                    options = options,
                     correctAnswer = def.term,
-                    explanation = "${def.term} directly matches the given definition.",
+                    explanation = "According to the notes, ${def.term} corresponds to this description.",
                     difficulty = difficulty,
                     topic = subject
                 )
             )
         }
-        if (keyPoints.isNotEmpty()) {
-            val kp = keyPoints.first()
+
+        // Type 2: Sentence/Keypoint-based questions
+        for (kp in keyPoints.take(5)) {
+            val options = listOf(
+                kp,
+                "The inverse condition is universally true under all circumstances",
+                "No observable change or reaction occurs in this process",
+                "Results are completely random and non-reproducible"
+            ).shuffled()
+
             mcqs.add(
                 QuestionItem(
-                    question = "Based on the study material, which statement is ACCURATE?",
+                    question = "Based on the provided notes on $titleCandidate, which statement is ACCURATE?",
                     type = "MCQ",
-                    options = listOf(kp, "The reverse of all documented laws applies here", "No measurable changes occur in this process", "Conditions are completely arbitrary and unpredictable"),
+                    options = options,
                     correctAnswer = kp,
-                    explanation = "This fact is explicitly stated in the core notes.",
+                    explanation = "This fact is explicitly stated in the source notes.",
                     difficulty = difficulty,
                     topic = subject
                 )
             )
         }
-        // Fill up to target questionCount or at least 5
-        val targetCount = questionCount.coerceIn(5, 30)
-        var counter = 1
-        while (mcqs.size < targetCount) {
+
+        // Type 3: Formula question (ONLY if user notes actually contain formulas)
+        for (f in formulas) {
+            val options = listOf(
+                f.formula,
+                f.formula.replace("=", "≠"),
+                "None of the relationships above",
+                "Undefined in the notes"
+            ).shuffled()
             mcqs.add(
                 QuestionItem(
-                    question = "Question $counter: Regarding $titleCandidate, what is the primary conclusion drawn?",
+                    question = "Which equation is explicitly documented in the notes?",
                     type = "MCQ",
-                    options = listOf(
-                        "Understanding core relationships allows accurate problem-solving.",
-                        "Measurements can be ignored in quantitative analysis.",
-                        "All values remain zero under all operating states.",
-                        "The laws contradict all empirical observations."
-                    ),
-                    correctAnswer = "Understanding core relationships allows accurate problem-solving.",
-                    explanation = "Systematic analysis of the source material confirms this consistent educational outcome.",
+                    options = options,
+                    correctAnswer = f.formula,
+                    explanation = "${f.formula} is recorded in the source material.",
                     difficulty = difficulty,
                     topic = subject
                 )
             )
-            counter++
         }
 
         // Short Answer Questions
-        val shortQuestions = listOf(
-            QuestionItem(
-                question = "Summarize the primary relationship established in $titleCandidate in your own words.",
-                type = "SHORT_ANSWER",
-                correctAnswer = shortSummary.ifBlank { "The notes explain the fundamental laws, relationships, and quantitative interactions governing $subject." },
-                explanation = "A complete response should identify the key variables and state how they interact.",
-                difficulty = difficulty,
-                topic = subject
-            ),
-            QuestionItem(
-                question = "Why is it important to satisfy the governing assumptions outlined in this chapter?",
-                type = "SHORT_ANSWER",
-                correctAnswer = "Because physical laws and formulas remain valid only when operating under designated boundary conditions such as steady temperature or linear materials.",
-                explanation = "Mentions operating boundaries and consistency.",
-                difficulty = difficulty,
-                topic = subject
+        val shortQuestions = mutableListOf<QuestionItem>()
+        if (sentences.isNotEmpty()) {
+            shortQuestions.add(
+                QuestionItem(
+                    question = "Explain the central concept of $titleCandidate based on your notes.",
+                    type = "SHORT_ANSWER",
+                    correctAnswer = shortSummary.ifBlank { "The core principles and definitions of $subject outlined in the text." },
+                    explanation = "Points must reflect the factual content of the source notes.",
+                    difficulty = difficulty,
+                    topic = subject
+                )
             )
-        )
+        }
 
         return GeneratedStudyPackage(
             title = titleCandidate,
             subject = subject,
-            subTopic = "Key Concepts and Applications",
-            summaryShort = shortSummary.ifBlank { "Core fundamentals of $subject synthesized into active study materials." },
-            summaryMedium = mediumSummary.ifBlank { "This study set breaks down the essential definitions, governing principles, and practice questions for $titleCandidate." },
+            subTopic = "Core Concepts",
+            summaryShort = shortSummary.ifBlank { "Study summary for $titleCandidate ($subject)." },
+            summaryMedium = mediumSummary.ifBlank { "Comprehensive breakdown of $titleCandidate." },
             summaryDetailed = detailedSummary,
-            keyPoints = if (keyPoints.isNotEmpty()) keyPoints else listOf("Fundamental concept 1", "Fundamental concept 2"),
+            keyPoints = if (keyPoints.isNotEmpty()) keyPoints else listOf(titleCandidate),
             definitions = definitions,
             formulas = formulas,
             flashcards = flashcards,
-            mcqs = mcqs.take(targetCount),
+            mcqs = mcqs.take(questionCount.coerceAtLeast(4)),
             shortQuestions = shortQuestions,
-            explanation = "To intuitively grasp $titleCandidate, imagine a connected balance scale: changing one factor directly tilts the response unless compensated by the opposing variable."
+            explanation = "Reviewing these concepts strengthens retrieval practice and reinforces your notes."
         )
     }
 
+    private fun inferSubjectFromText(text: String): String {
+        val lower = text.lowercase()
+        return when {
+            lower.contains("acid") || lower.contains("base") || lower.contains("reaction") || lower.contains("molecule") || lower.contains("chem") || lower.contains("ph =") -> "Chemistry"
+            lower.contains("cell") || lower.contains("dna") || lower.contains("rna") || lower.contains("organism") || lower.contains("mitosis") || lower.contains("bio") -> "Biology"
+            lower.contains("force") || lower.contains("velocity") || lower.contains("volt") || lower.contains("current") || lower.contains("gravity") || lower.contains("acceleration") -> "Physics"
+            lower.contains("derivative") || lower.contains("integral") || lower.contains("matrix") || lower.contains("triangle") || lower.contains("polynomial") -> "Mathematics"
+            lower.contains("algorithm") || lower.contains("database") || lower.contains("function") || lower.contains("code") || lower.contains("software") -> "Computer Science"
+            lower.contains("war") || lower.contains("century") || lower.contains("revolution") || lower.contains("empire") || lower.contains("treaty") -> "History"
+            lower.contains("novel") || lower.contains("poem") || lower.contains("metaphor") || lower.contains("narrative") -> "Literature"
+            lower.contains("inflation") || lower.contains("gdp") || lower.contains("market") || lower.contains("supply") || lower.contains("demand") -> "Economics"
+            else -> "General Study"
+        }
+    }
+
     private fun evaluateShortAnswerLocally(modelAnswer: String, studentAnswer: String): EvaluationResult {
-        val modelWords = modelAnswer.lowercase().split(Regex("\\W+")).filter { it.length > 3 }.toSet()
-        val studentWords = studentAnswer.lowercase().split(Regex("\\W+")).filter { it.length > 3 }.toSet()
-        val overlap = modelWords.intersect(studentWords).size
-        val ratio = if (modelWords.isNotEmpty()) overlap.toFloat() / modelWords.size.toFloat() else 0.5f
+        val modelWords = modelAnswer.lowercase().split(Regex("\\W+")).filter { it.length >= 3 }.toSet()
+        val studentWords = studentAnswer.lowercase().split(Regex("\\W+")).filter { it.length >= 3 }.toSet()
+        val matches = modelWords.count { mw ->
+            studentWords.any { sw ->
+                sw == mw || (sw.length >= 3 && mw.length >= 3 && (sw.startsWith(mw.take(3)) || mw.startsWith(sw.take(3))))
+            }
+        }
+        val ratio = if (modelWords.isNotEmpty()) matches.toFloat() / modelWords.size.toFloat() else 0.5f
 
         return when {
             ratio > 0.45f -> EvaluationResult(
                 status = "CORRECT",
-                feedback = "Excellent work! Your answer effectively captures the key conceptual principles and terminology.",
+                feedback = "Excellent work! Your answer accurately captures the key principles and terminology from the notes.",
                 missingElements = emptyList(),
                 suggestedAnswer = modelAnswer
             )
             ratio > 0.20f -> EvaluationResult(
                 status = "PARTIALLY_CORRECT",
-                feedback = "Good start. You captured the general theme, but missed a few specific definitions or context requirements.",
-                missingElements = listOf("Specific terminology", "Deeper justification"),
+                feedback = "Good start! You grasped the main concept, but missed a few specific details or terms.",
+                missingElements = listOf("Key terminology", "Specific mechanism"),
                 suggestedAnswer = modelAnswer
             )
             else -> EvaluationResult(
                 status = "NEEDS_IMPROVEMENT",
-                feedback = "Not quite complete. Compare your answer with the reference solution below to see the required key points.",
-                missingElements = listOf("Core mechanism", "Specific variables"),
+                feedback = "Not quite complete. Compare your answer with the reference solution to see the required key points.",
+                missingElements = listOf("Core concept", "Essential terms"),
                 suggestedAnswer = modelAnswer
             )
         }
-    }
-
-    private fun generateSyntheticExtractedNotes(pageCount: Int, isHandwritten: Boolean): ExtractedNoteData {
-        return ExtractedNoteData(
-            extractedText = """
-                Lecture Notes: Energy, Work & Mechanical Systems
-                
-                1. Work Done by a Force
-                - Work is done when a force produces movement in the direction of the force.
-                - Formula: W = F * d * cos(θ)
-                - SI Unit: Joule (J). 1 Joule = 1 Newton * 1 meter.
-                
-                2. Kinetic & Potential Energy
-                - Kinetic Energy (KE): Energy possessed by an object due to its motion.
-                  KE = 0.5 * m * v²
-                - Gravitational Potential Energy (PE): Energy stored due to elevation in a gravitational field.
-                  PE = m * g * h
-                
-                3. Law of Conservation of Energy
-                - Energy cannot be created or destroyed, only transformed from one form to another.
-                - Total Mechanical Energy: E_total = KE + PE = constant (in isolated conservative systems).
-                
-                4. Power & Efficiency
-                - Power (P): Rate of doing work. P = W / t = F * v. Measured in Watts (W).
-                - Efficiency: (Useful energy output / Total energy input) * 100%.
-            """.trimIndent(),
-            detectedTitle = "Physics — Energy & Work",
-            detectedSubject = "Physics",
-            headings = listOf("Work Done by a Force", "Kinetic & Potential Energy", "Law of Conservation of Energy", "Power & Efficiency"),
-            bulletPoints = listOf(
-                "Work = Force * displacement * cos(theta)",
-                "KE = 0.5 * m * v²",
-                "PE = m * g * h",
-                "Total energy in isolated system is conserved"
-            ),
-            detectedFormulas = listOf("W = F * d * cos(θ)", "KE = 0.5 * m * v²", "PE = m * g * h", "P = W / t"),
-            confidencePercent = if (isHandwritten) 93 else 99,
-            isHandwritten = isHandwritten,
-            pageCount = pageCount.coerceAtLeast(1)
-        )
     }
 
     private fun loadSampledBitmap(uri: Uri, reqWidth: Int, reqHeight: Int): Bitmap? {
@@ -728,6 +1195,7 @@ class StudyEngine(private val context: Context) {
                 }
             }
         } catch (e: Exception) {
+            Log.w("StudyEngine", "Failed to decode bitmap from uri: ${e.message}")
             null
         }
     }

@@ -206,8 +206,16 @@ class StudyRepository(
         selectedComponents: Set<String>,
         difficulty: String,
         questionCount: Int,
+        avoidQuestions: List<String> = emptyList(),
         onProgress: (String, Float) -> Unit = { _, _ -> }
-    ): GeneratedStudyPackage = studyEngine.generateStudyPackage(noteText, selectedComponents, difficulty, questionCount, onProgress)
+    ): GeneratedStudyPackage = studyEngine.generateStudyPackage(
+        noteText = noteText,
+        selectedComponents = selectedComponents,
+        difficulty = difficulty,
+        questionCount = questionCount,
+        avoidQuestions = avoidQuestions,
+        onProgress = onProgress
+    )
 
     suspend fun evaluateShortAnswer(
         question: String,
